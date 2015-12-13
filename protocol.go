@@ -5,6 +5,8 @@ package imap
 import (
 	"log"
 	"strings"
+
+	"github.com/mailhog/backends/auth"
 )
 
 // Command is a struct representing an SMTP command (verb + arguments)
@@ -18,6 +20,11 @@ type Command struct {
 // ParseCommand returns a Command from the line string
 func ParseCommand(line string) *Command {
 	words := strings.Split(line, " ")
+	if len(words) < 2 {
+		// FIXME error
+		return nil
+	}
+
 	tag := strings.ToUpper(words[0])
 	command := strings.ToUpper(words[1])
 	args := strings.Join(words[2:len(words)], " ")
@@ -32,10 +39,13 @@ func ParseCommand(line string) *Command {
 
 // Protocol is a state machine representing an SMTP session
 type Protocol struct {
+	readIntercept func(l string)
+
 	TLSPending  bool
 	TLSUpgraded bool
 
-	State State
+	State     State
+	Responses chan *Response
 
 	Hostname string
 	Ident    string
@@ -43,13 +53,15 @@ type Protocol struct {
 
 	MaximumLineLength int
 
+	Capabilities map[string]Capability
+
 	// LogHandler is called for each log message. If nil, log messages will
 	// be output using log.Printf instead.
 	LogHandler func(message string, args ...interface{})
 	// ValidateAuthenticationhandler should return true if the authentication
 	// parameters are valid, otherwise false. If nil, all authentication
 	// attempts will be accepted.
-	ValidateAuthenticationHandler func(mechanism string, args ...string) (errorResponse *Response, ok bool)
+	ValidateAuthenticationHandler func(mechanism string, args ...string) (ok bool)
 	// TLSHandler is called when a STARTTLS command is received.
 	//
 	// It should acknowledge the TLS request and set ok to true.
@@ -70,15 +82,51 @@ type Protocol struct {
 	RequireTLS bool
 }
 
+// Capability represents an IMAP capability
+type Capability interface {
+	Name() string
+	Available(p *Protocol) bool
+}
+
+// GenericCapability represents a generic IMAP4rev1 capability
+type GenericCapability struct {
+	name       string
+	requireTLS bool
+	skipIfTLS  bool
+}
+
+// Name implements Capability.Name
+func (gc *GenericCapability) Name() string {
+	return gc.name
+}
+
+// Available implements Capability.Available
+func (gc *GenericCapability) Available(p *Protocol) bool {
+	if gc.requireTLS && !p.TLSUpgraded {
+		return false
+	}
+	if gc.skipIfTLS && p.TLSUpgraded {
+		return false
+	}
+	return true
+}
+
 // NewProtocol returns a new SMTP state machine in INVALID state
-// handler is called when a message is received and should return a message ID
-func NewProtocol() *Protocol {
+func NewProtocol(responses chan *Response) *Protocol {
 	p := &Protocol{
 		Hostname:          "mailhog.example",
 		Ident:             "MailHog",
 		Revision:          "IMAP4rev1",
 		State:             INVALID,
 		MaximumLineLength: 8000,
+		Responses:         responses,
+
+		Capabilities: map[string]Capability{
+			"IMAP4rev1":     &GenericCapability{name: "IMAP4rev1"},
+			"STARTTLS":      &GenericCapability{name: "STARTTLS", skipIfTLS: true},
+			"LOGINDISABLED": &GenericCapability{name: "IMAP4rev1"},
+			"AUTH=PLAIN":    &GenericCapability{name: "AUTH=PLAIN", requireTLS: true},
+		},
 	}
 	return p
 }
@@ -107,11 +155,9 @@ func (proto *Protocol) Start() *Response {
 // new line is found.
 // - TODO decide whether to move this to a buffer inside Protocol
 //   sort of like it this way, since it gives control back to the caller
-func (proto *Protocol) Parse(line string) (string, *Response) {
-	var Response *Response
-
+func (proto *Protocol) Parse(line string) string {
 	if !strings.Contains(line, "\r\n") {
-		return line, Response
+		return line
 	}
 
 	parts := strings.SplitN(line, "\r\n", 2)
@@ -119,56 +165,131 @@ func (proto *Protocol) Parse(line string) (string, *Response) {
 
 	if proto.MaximumLineLength > -1 {
 		if len(parts[0]) > proto.MaximumLineLength {
-			return line, ResponseLineTooLong("*") // FIXME should be tagged
+			proto.Responses <- ResponseLineTooLong("*") // FIXME should be tagged
+			return line
 		}
 	}
 
-	Response = proto.ProcessCommand(parts[0])
+	if proto.readIntercept != nil {
+		proto.readIntercept(parts[0])
+	} else {
+		proto.ProcessCommand(parts[0])
+	}
 
-	return line, Response
+	return line
 }
 
 // ProcessCommand processes a line of text as a command
 // It expects the line string to be a properly formed SMTP verb and arguments
-func (proto *Protocol) ProcessCommand(line string) (Response *Response) {
+func (proto *Protocol) ProcessCommand(line string) {
 	line = strings.Trim(line, "\r\n")
 	proto.logf("Processing line: %s", line)
 
 	words := strings.Split(line, " ")
-	command := strings.ToUpper(words[0])
-	args := strings.Join(words[1:len(words)], " ")
-	proto.logf("In state %d, got command '%s', args '%s'", proto.State, command, args)
+	if len(words) < 2 {
+		proto.logf("Unable to parse line")
+		t := "*"
+		if len(words) > 0 {
+			t = words[0]
+		}
+		proto.Responses <- ResponseUnrecognisedCommand(t)
+		return
+	}
+
+	tag := words[0]
+	command := strings.ToUpper(words[1])
+	args := strings.Join(words[2:len(words)], " ")
+	proto.logf("In state %d, got tag '%s' for command '%s', args '%s'", proto.State, tag, command, args)
 
 	cmd := ParseCommand(strings.TrimSuffix(line, "\r\n"))
-	return proto.Command(cmd)
+	proto.Command(cmd)
 }
 
 // Command applies an SMTP verb and arguments to the state machine
-func (proto *Protocol) Command(command *Command) (Response *Response) {
+func (proto *Protocol) Command(command *Command) {
 	switch {
 	case proto.TLSPending && !proto.TLSUpgraded:
 		proto.logf("Got command before TLS upgrade complete")
-		// FIXME what to do?
-		return ResponseBye()
-	default:
-		proto.logf("Command not recognised")
-		return ResponseUnrecognisedCommand("*") // FIXME should be tagged
+		proto.Responses <- &Response{"*", Status(ResponseBYE), nil, "", nil}
+		proto.State = LOGOUT
+		return
+	case "CAPABILITY" == command.command:
+		proto.CAPABILITY(command)
+		return
+	case "NOOP" == command.command:
+		proto.Responses <- &Response{command.tag, Status(ResponseOK), nil, "", nil}
+		return
+	case "LOGOUT" == command.command:
+		proto.Responses <- &Response{"*", Status(ResponseBYE), nil, "", nil}
+		proto.Responses <- &Response{command.tag, Status(ResponseOK), nil, "", nil}
+		proto.State = LOGOUT
+		return
+	case PREAUTH == proto.State:
+		switch command.command {
+		case "STARTTLS":
+			proto.STARTTLS(command)
+			return
+		case "AUTHENTICATE":
+			proto.AUTHENTICATE(command)
+			return
+		case "LOGIN":
+			proto.Responses <- &Response{command.tag, Status(ResponseBAD), nil, "", nil}
+			return
+		}
+		proto.logf("command not found in PREAUTH state")
+	case AUTH == proto.State:
+		switch command.command {
+		case "SELECT":
+		case "EXAMINE":
+		case "CREATE":
+		case "DELETE":
+		case "RENAME":
+		case "SUBSCRIBE":
+		case "UNSUBSCRIBE":
+		case "LIST":
+			// FIXME hook
+			proto.Responses <- &Response{"*", nil, nil, `LIST (\Noselect) "/" ""`, nil}
+			proto.Responses <- &Response{command.tag, Status(ResponseOK), nil, "", nil}
+			return
+		case "LSUB":
+		case "STATUS":
+		case "APPEND":
+		}
+		proto.logf("command not found in AUTH state")
+	case SELECTED == proto.State:
+		switch command.command {
+		case "CHECK":
+		case "CLOSE":
+		case "EXPUNGE":
+		case "SEARCH":
+		case "FETCH":
+		case "STORE":
+		case "COPY":
+		case "UID":
+		}
+		proto.logf("command not found in PREAUTH state")
 	}
+
+	proto.logf("Command not recognised")
+	proto.Responses <- ResponseUnrecognisedCommand("*") // FIXME should be tagged
 }
 
 // STARTTLS creates a Response to a STARTTLS command
-func (proto *Protocol) STARTTLS(args string) (Response *Response) {
+func (proto *Protocol) STARTTLS(command *Command) {
 	if proto.TLSUpgraded {
-		return ResponseUnrecognisedCommand("*") // FIXME should be tagged
+		proto.Responses <- ResponseUnrecognisedCommand(command.tag)
+		return
 	}
 
 	if proto.TLSHandler == nil {
 		proto.logf("tls handler not found")
-		return ResponseUnrecognisedCommand("*") // FIXME should be tagged
+		proto.Responses <- ResponseUnrecognisedCommand(command.tag)
+		return
 	}
 
-	if len(args) > 0 {
-		return ResponseSyntaxError("no parameters allowed")
+	if len(command.args) > 0 {
+		proto.Responses <- ResponseSyntaxError("no parameters allowed")
+		return
 	}
 
 	r, callback, ok := proto.TLSHandler(func(ok bool) {
@@ -179,9 +300,79 @@ func (proto *Protocol) STARTTLS(args string) (Response *Response) {
 		}
 	})
 	if !ok {
-		return r
+		proto.Responses <- r
+		return
 	}
 
 	proto.TLSPending = true
-	return ResponseReadyToStartTLS("*", callback) // FIXME should be tagged
+	proto.Responses <- ResponseReadyToStartTLS(command.tag, callback)
+	return
+}
+
+// CAPABILITY implements RFC3501 CAPABILITY command
+func (proto *Protocol) CAPABILITY(cmd *Command) {
+	// Return untagged CAPABILITY
+	var capabilities []string
+	for k, v := range proto.Capabilities {
+		if !v.Available(proto) {
+			continue
+		}
+		capabilities = append(capabilities, k)
+	}
+	proto.Responses <- &Response{"*", nil, Code(CAPABILITY), strings.Join(capabilities, " "), nil}
+
+	// Return tagged OK
+	proto.Responses <- &Response{cmd.tag, Status(ResponseOK), nil, "", nil}
+}
+
+// AUTHENTICATE implements RFC3501 AUTHENTICATE command
+func (proto *Protocol) AUTHENTICATE(command *Command) {
+	args := strings.Split(command.args, " ")
+
+	if len(args) < 1 {
+		// FIXME what error?
+		proto.Responses <- ResponseUnrecognisedCommand(command.tag)
+		return
+	}
+
+	switch strings.ToUpper(args[0]) {
+	case "PLAIN":
+		if len(args) > 1 {
+			// Do auth now
+			return
+		}
+		proto.readIntercept = func(l string) {
+			proto.readIntercept = nil
+			user, pass, err := auth.DecodePLAIN(l)
+			if err != nil {
+				// FIXME what error?
+				proto.Responses <- ResponseUnrecognisedCommand(command.tag)
+				return
+			}
+			if ok := proto.ValidateAuthenticationHandler("PLAIN", user, pass); !ok {
+				// FIXME what error?
+				proto.Responses <- ResponseUnrecognisedCommand(command.tag)
+				return
+			}
+			// OK
+			proto.State = AUTH
+			proto.Responses <- &Response{command.tag, Status(ResponseOK), nil, "", nil}
+			return
+		}
+		proto.Responses <- &Response{"+", nil, nil, "", nil}
+		return
+	}
+
+	// FIXME what error?
+	proto.Responses <- ResponseUnrecognisedCommand(command.tag)
+}
+
+// SELECT implements RFC3501 SELECT command
+func (proto *Protocol) SELECT(command *Command) {
+
+}
+
+// CREATE implements RFC3501 CREATE command
+func (proto *Protocol) CREATE(command *Command) {
+
 }

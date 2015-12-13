@@ -5,7 +5,7 @@ package imap
 // Response is a struct representing an IMAP response
 type Response struct {
 	Tag    string
-	Status ResponseStatus
+	Status *ResponseStatus
 	Code   *ResponseCode
 	Text   string
 	Done   func()
@@ -64,44 +64,63 @@ const (
 	UNSEEN = ResponseCode("UNSEEN")
 )
 
+// Code returns a pointer to a ResponseCode value
+func Code(r ResponseCode) *ResponseCode {
+	return &r
+}
+
+// Status returns a pointer to a ResponseStatus value
+func Status(r ResponseStatus) *ResponseStatus {
+	return &r
+}
+
 // Lines returns the formatted SMTP reply
 func (r Response) Lines() []string {
-	l := r.Tag + " " + ResponseStatusMapping[r.Status]
+	l := r.Tag
+	if r.Status != nil {
+		l += " " + ResponseStatusMapping[*r.Status]
+	}
 	if c := r.Code; c != nil && len(*c) > 0 {
-		l += " [" + string(*c) + "]"
+		l += " " + string(*c)
 	}
 	if len(r.Text) > 0 {
 		l += " " + r.Text
 	}
+	l += "\r\n"
 	return []string{l}
 }
 
 // ResponseIdent returns an OK server ready response
 func ResponseIdent(revision, hostname, ident string) *Response {
-	return &Response{"*", ResponseOK, nil, revision + " " + ident + " (" + hostname + ") server ready", nil}
+	return &Response{"*", Status(ResponseOK), nil, revision + " " + ident + " (" + hostname + ") server ready", nil}
 }
 
 // ResponseLineTooLong returns a BAD error response
 func ResponseLineTooLong(tag string) *Response {
-	return &Response{tag, ResponseBAD, nil, "line exceeded maximum length", nil}
+	return &Response{tag, Status(ResponseBAD), nil, "line exceeded maximum length", nil}
 }
 
 // ResponseUnrecognisedCommand returns a tagged unrecognised command response
 func ResponseUnrecognisedCommand(tag string) *Response {
-	return &Response{tag, ResponseBAD, nil, "unrecognised command", nil}
+	return &Response{tag, Status(ResponseBAD), nil, "unrecognised command", nil}
 }
 
 // ResponseSyntaxError returns a tagged syntax error response
 func ResponseSyntaxError(tag string) *Response {
-	return &Response{tag, ResponseBAD, nil, "syntax error", nil}
+	return &Response{tag, Status(ResponseBAD), nil, "syntax error", nil}
 }
 
 // ResponseReadyToStartTLS returns a tagged OK response
 func ResponseReadyToStartTLS(tag string, done func()) *Response {
-	return &Response{tag, ResponseOK, nil, "ready to start TLS", done}
+	return &Response{tag, Status(ResponseOK), nil, "ready to start TLS", done}
 }
 
 // ResponseBye returns an untagged BYE response
 func ResponseBye() *Response {
-	return &Response{"*", ResponseBYE, nil, "", nil}
+	return &Response{"*", Status(ResponseBYE), nil, "", nil}
+}
+
+// ResponseError returns a BAD response containing the error text
+func ResponseError(tag string, err error) *Response {
+	return &Response{tag, Status(ResponseBAD), nil, err.Error(), nil}
 }
